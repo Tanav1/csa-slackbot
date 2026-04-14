@@ -1,5 +1,6 @@
 import csv
 import os
+import re
 import logging
 import threading
 import time
@@ -240,8 +241,8 @@ def handle_message(event, logger):
         )
 
 
-@app.action("view_unanswered_message")
-def handle_view_button(ack):
+@app.action(re.compile(".*"))
+def handle_any_action(ack):
     ack()
 
 
