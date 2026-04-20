@@ -5,6 +5,7 @@ import logging
 import threading
 import time
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 import requests as http_requests
 from slack_bolt import App
@@ -21,9 +22,31 @@ ALERT_CHANNEL_ID = os.environ["ALERT_CHANNEL_ID"]
 RESPONSE_TIMEOUT_SECONDS = int(os.environ.get("RESPONSE_TIMEOUT_MINUTES", "120")) * 60
 
 SB_URL = os.environ["SUPABASE_URL"]
-SB_KEY = os.environ["SUPABASE_ANON_KEY"]
+SB_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or os.environ["SUPABASE_ANON_KEY"]
 
 _DIR = os.path.dirname(__file__)
+
+EASTERN = ZoneInfo("America/New_York")
+BUSINESS_OPEN_HOUR  = 9
+BUSINESS_CLOSE_HOUR = 17
+BUSINESS_CLOSE_MIN  = 30
+
+WEEKEND_AUTO_REPLY = (
+    "Hi there! We received your message, but our team is away for the weekend. "
+    "We'll be back Monday morning and will make sure to follow up with you then. "
+    "Thanks for being patient!"
+)
+
+
+def _business_hours_status() -> tuple[bool, bool]:
+    """Return (is_open, is_weekend) based on current Eastern time."""
+    now = datetime.now(EASTERN)
+    is_weekend = now.weekday() >= 5  # Saturday=5, Sunday=6
+    if is_weekend:
+        return False, True
+    start = now.replace(hour=BUSINESS_OPEN_HOUR, minute=0, second=0, microsecond=0)
+    end   = now.replace(hour=BUSINESS_CLOSE_HOUR, minute=BUSINESS_CLOSE_MIN, second=0, microsecond=0)
+    return start <= now <= end, False
 
 
 # ── Load config from CSVs ─────────────────────────────────────────────────────
@@ -224,7 +247,26 @@ def handle_message(event, logger):
         if any(k[0] == channel_id for k in pending):
             _cancel_channel_pending(channel_id, user_id)
     else:
-        # A non-staff (client) sent a message — start tracking it
+        # A non-staff (client) sent a message
+        is_open, is_weekend = _business_hours_status()
+
+        if is_weekend:
+            try:
+                app.client.chat_postMessage(
+                    channel=channel_id,
+                    thread_ts=message_ts,
+                    text=WEEKEND_AUTO_REPLY,
+                )
+                logger.info("Sent weekend auto-reply in #%s", MONITORED_CHANNELS.get(channel_id, channel_id))
+            except Exception as exc:
+                logger.error("Failed to send weekend auto-reply: %s", exc)
+            return
+
+        if not is_open:
+            logger.info("Outside business hours — not tracking message %s", message_ts)
+            return
+
+        # Within business hours — start tracking
         channel_name = MONITORED_CHANNELS.get(channel_id, channel_id)
         with pending_lock:
             pending[(channel_id, message_ts)] = {
@@ -244,6 +286,11 @@ def handle_message(event, logger):
 @app.action(re.compile(".*"))
 def handle_any_action(ack):
     ack()
+
+
+@app.event("reaction_added")
+def handle_reaction_added(body):
+    pass
 
 
 # ── Alert sending ─────────────────────────────────────────────────────────────
