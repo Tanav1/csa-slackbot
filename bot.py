@@ -178,6 +178,14 @@ def _user_name(user_id: str) -> str:
     return _user_cache[user_id]
 
 
+_MENTION_RE = re.compile(r"<@([A-Z0-9]+)>")
+
+
+def _resolve_mentions(text: str) -> str:
+    """Replace <@USERID> tokens with @display_name."""
+    return _MENTION_RE.sub(lambda m: f"@{_user_name(m.group(1))}", text)
+
+
 # ── Unanswered tracking ───────────────────────────────────────────────────────
 # Key: (channel_id, message_ts) — only non-responder messages are tracked.
 
@@ -231,7 +239,7 @@ def handle_message(event, logger):
             "is_thread_reply": is_reply,
             "user_id":         user_id,
             "user_name":       _user_name(user_id),
-            "text":            event.get("text") or "",
+            "text":            _resolve_mentions(event.get("text") or ""),
             "has_response":    is_responder,
             "created_at":      datetime.fromtimestamp(
                                    float(message_ts), tz=timezone.utc
@@ -301,20 +309,23 @@ def _send_alert(info: dict) -> None:
     slack_ts     = info["slack_ts"]
     timeout_min  = RESPONSE_TIMEOUT_SECONDS // 60
     permalink    = f"https://slack.com/archives/{channel_id}/p{slack_ts.replace('.', '')}"
-    preview      = info["text"] or "(no text)"
+    raw_text     = info["text"] or ""
+    preview      = _resolve_mentions(raw_text) or "(no text)"
+    has_mention  = bool(_MENTION_RE.search(raw_text))
+    notify       = "<!channel> " if has_mention else ""
     info.setdefault("user_name", _user_name(info.get("user", "")))
 
     try:
         app.client.chat_postMessage(
             channel=ALERT_CHANNEL_ID,
-            text=f"<!channel> :warning: Unanswered message in #{channel_name} — {permalink}",
+            text=f"{notify}:warning: Unanswered message in #{channel_name} — {permalink}",
             blocks=[
                 {
                     "type": "section",
                     "text": {
                         "type": "mrkdwn",
                         "text": (
-                            f"<!channel> :warning: *Unanswered message* in <#{channel_id}>\n"
+                            f"{notify}:warning: *Unanswered message* in <#{channel_id}>\n"
                             f"No response from staff after *{timeout_min} minutes*."
                         ),
                     },
