@@ -194,16 +194,16 @@ pending_lock = threading.Lock()
 
 
 def _cancel_channel_pending(channel_id: str, responder_id: str) -> None:
-    """A responder sent a message — cancel all pending items for this channel."""
+    """A responder replied — cancel pending items where they were @mentioned."""
     cancelled = []
     with pending_lock:
         for key in list(pending.keys()):
-            if key[0] == channel_id:
+            if key[0] == channel_id and responder_id in pending[key].get("mentioned_responders", set()):
                 cancelled.append(pending.pop(key))
 
     for info in cancelled:
         logger.info(
-            "Resolved: %s in %s (responder %s)", info["slack_ts"], channel_id, responder_id
+            "Resolved: %s in %s (@%s replied)", info["slack_ts"], channel_id, responder_id
         )
         threading.Thread(
             target=lambda i=info: (
@@ -250,12 +250,18 @@ def handle_message(event, logger):
     threading.Thread(target=_store, daemon=True).start()
 
     # ── Alert logic ───────────────────────────────────────────────────────────
+    text = event.get("text") or ""
+
     if is_responder:
-        # A Savvy staff member responded — clear all pending for this channel
+        # A Savvy staff member replied — cancel pending items where they were tagged
         if any(k[0] == channel_id for k in pending):
             _cancel_channel_pending(channel_id, user_id)
     else:
-        # A non-staff (client) sent a message
+        # A non-staff (client) sent a message — only track if a staff member is @mentioned
+        mentioned_responders = set(_MENTION_RE.findall(text)) & RESPONDER_IDS
+        if not mentioned_responders:
+            return
+
         is_open, is_weekend = _business_hours_status()
 
         if is_weekend:
@@ -278,16 +284,17 @@ def handle_message(event, logger):
         channel_name = MONITORED_CHANNELS.get(channel_id, channel_id)
         with pending_lock:
             pending[(channel_id, message_ts)] = {
-                "channel":      channel_id,
-                "channel_name": channel_name,
-                "slack_ts":     message_ts,
-                "float_ts":     float(message_ts),
-                "user":         user_id,
-                "text":         (event.get("text") or "")[:500],
+                "channel":             channel_id,
+                "channel_name":        channel_name,
+                "slack_ts":            message_ts,
+                "float_ts":            float(message_ts),
+                "user":                user_id,
+                "text":                text[:500],
+                "mentioned_responders": mentioned_responders,
             }
         logger.info(
-            "Tracking client message %s in #%s (timeout: %d min)",
-            message_ts, channel_name, RESPONSE_TIMEOUT_SECONDS // 60,
+            "Tracking message %s in #%s — tagged staff: %s (timeout: %d min)",
+            message_ts, channel_name, mentioned_responders, RESPONSE_TIMEOUT_SECONDS // 60,
         )
 
 
@@ -308,31 +315,32 @@ def _send_alert(info: dict) -> None:
     channel_name = info.get("channel_name", channel_id)
     slack_ts     = info["slack_ts"]
     timeout_min  = RESPONSE_TIMEOUT_SECONDS // 60
-    permalink    = f"https://slack.com/archives/{channel_id}/p{slack_ts.replace('.', '')}"
+    try:
+        permalink = app.client.chat_getPermalink(channel=channel_id, message_ts=slack_ts)["permalink"]
+    except Exception:
+        permalink = f"https://slack.com/archives/{channel_id}/p{slack_ts.replace('.', '')}"
     raw_text     = info["text"] or ""
     preview      = _resolve_mentions(raw_text) or "(no text)"
-    has_mention  = bool(_MENTION_RE.search(raw_text))
-    notify       = "<!channel> " if has_mention else ""
     info.setdefault("user_name", _user_name(info.get("user", "")))
+    mentioned_responders = info.get("mentioned_responders", set())
+
+    mentions = " ".join(f"<@{uid}>" for uid in mentioned_responders)
+    fallback = f":warning: {mentions} — no response after {timeout_min} minutes. {permalink}"
 
     try:
         app.client.chat_postMessage(
-            channel=ALERT_CHANNEL_ID,
-            text=f"{notify}:warning: Unanswered message in #{channel_name} — {permalink}",
+            channel=channel_id,
+            thread_ts=slack_ts,
+            text=fallback,
             blocks=[
                 {
                     "type": "section",
                     "text": {
                         "type": "mrkdwn",
                         "text": (
-                            f"{notify}:warning: *Unanswered message* in <#{channel_id}>\n"
-                            f"No response from staff after *{timeout_min} minutes*."
+                            f":warning: {mentions} — this message hasn't been responded to after *{timeout_min} minutes*."
                         ),
                     },
-                },
-                {
-                    "type": "section",
-                    "text": {"type": "mrkdwn", "text": f">{preview}"},
                 },
                 {
                     "type": "actions",
@@ -347,7 +355,7 @@ def _send_alert(info: dict) -> None:
                 },
             ],
         )
-        logger.info("Alert sent for %s in #%s", slack_ts, channel_name)
+        logger.info("Alert sent in #%s for %s", channel_name, slack_ts)
     except Exception as exc:
         logger.error("Failed to send alert: %s", exc)
 
