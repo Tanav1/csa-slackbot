@@ -344,8 +344,7 @@ def _send_alert(info: dict) -> None:
     info.setdefault("user_name", _user_name(info.get("user", "")))
     mentioned_responders = info.get("mentioned_responders", set())
 
-    mentions = " ".join(f"<@{uid}>" for uid in mentioned_responders)
-    fallback = f":warning: {mentions} — no response after {timeout_min} minutes. {permalink}"
+    fallback = f":warning: No response after {timeout_min} minutes: \"{preview}\" {permalink}"
 
     try:
         app.client.chat_postMessage(
@@ -356,9 +355,7 @@ def _send_alert(info: dict) -> None:
                     "type": "section",
                     "text": {
                         "type": "mrkdwn",
-                        "text": (
-                            f":warning: {mentions} — this message hasn't been responded to after *{timeout_min} minutes*."
-                        ),
+                        "text": f":warning: No response after *{timeout_min} minutes*:\n\"{preview}\"",
                     },
                 },
                 {
