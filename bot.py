@@ -305,7 +305,24 @@ def handle_any_action(ack):
 
 @app.event("reaction_added")
 def handle_reaction_added(body):
-    pass
+    event = body.get("event", {})
+    item = event.get("item", {})
+    if item.get("type") != "message":
+        return
+    channel_id = item.get("channel")
+    message_ts = item.get("ts")
+    resolved_info = None
+    with pending_lock:
+        resolved_info = pending.pop((channel_id, message_ts), None)
+    if resolved_info:
+        logger.info("Resolved via reaction: %s in %s", message_ts, channel_id)
+        threading.Thread(
+            target=lambda i=resolved_info: (
+                _sb_mark_responded(i["channel"], i["slack_ts"]),
+                _sb_resolve_unanswered(i["channel"], i["slack_ts"]),
+            ),
+            daemon=True,
+        ).start()
 
 
 # ── Alert sending ─────────────────────────────────────────────────────────────
@@ -329,8 +346,7 @@ def _send_alert(info: dict) -> None:
 
     try:
         app.client.chat_postMessage(
-            channel=channel_id,
-            thread_ts=slack_ts,
+            channel=ALERT_CHANNEL_ID,
             text=fallback,
             blocks=[
                 {
