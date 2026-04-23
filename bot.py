@@ -262,6 +262,9 @@ def handle_message(event, logger):
         if not mentioned_responders:
             return
 
+        if "thank" in text.lower():
+            return
+
         is_open, is_weekend = _business_hours_status()
 
         if is_weekend:
