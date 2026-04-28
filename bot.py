@@ -254,8 +254,12 @@ def handle_message(event, logger):
 
     if is_responder:
         # A Savvy staff member replied — cancel pending items where they were tagged
+        channel_name = MONITORED_CHANNELS.get(channel_id, channel_id)
+        logger.info("Staff reply from %s in #%s (thread: %s)", user_id, channel_name, thread_ts or "none")
         if any(k[0] == channel_id for k in pending):
             _cancel_channel_pending(channel_id, user_id)
+        else:
+            logger.info("No pending items in #%s to cancel", channel_name)
     else:
         # A non-staff (client) sent a message — only track if a staff member is @mentioned
         mentioned_responders = set(_MENTION_RE.findall(text)) & RESPONDER_IDS
@@ -314,13 +318,25 @@ def handle_reaction_added(body):
         return
     channel_id = item.get("channel")
     message_ts = item.get("ts")
-    resolved_info = None
+    item_user  = event.get("item_user")  # sender of the message that was reacted to
+    reaction_float = float(message_ts)
+
+    resolved = []
     with pending_lock:
-        resolved_info = pending.pop((channel_id, message_ts), None)
-    if resolved_info:
-        logger.info("Resolved via reaction: %s in %s", message_ts, channel_id)
+        for key in list(pending.keys()):
+            if key[0] != channel_id:
+                continue
+            info = pending[key]
+            # Exact match OR: reaction is on a later message from the same client
+            if key[1] == message_ts or (
+                item_user and info.get("user") == item_user and reaction_float >= info["float_ts"]
+            ):
+                resolved.append(pending.pop(key))
+
+    for info in resolved:
+        logger.info("Resolved via reaction: %s in %s", info["slack_ts"], channel_id)
         threading.Thread(
-            target=lambda i=resolved_info: (
+            target=lambda i=info: (
                 _sb_mark_responded(i["channel"], i["slack_ts"]),
                 _sb_resolve_unanswered(i["channel"], i["slack_ts"]),
             ),
