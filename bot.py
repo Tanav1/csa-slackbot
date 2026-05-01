@@ -79,6 +79,31 @@ def _load_monitored_channels() -> dict[str, str]:
 # People responsible for responding — messages from anyone NOT in this set trigger the timer
 RESPONDER_IDS: set[str] = _load_responder_ids()
 
+# Subset of staff whose @mentions actually trigger alerts (CSA/ops team)
+TRACKED_RESPONDER_IDS: frozenset[str] = frozenset({
+    "U08H13SRPFC",  # Alex Galbo
+    "U03LPSP0DB4",  # Amir Har-El
+    "U0AT0JS3P16",  # Anaiss Zamora
+    "U09MQRZ21S6",  # Avi Claire Chabot
+    "U0AQDS9KJ83",  # Elena Schumakoff
+    "U091G9TBAV9",  # Erica Luchetti
+    "U041Z9KCLGG",  # Hillary Peterson
+    "U0AAP6TFLHW",  # Jennifer Battles
+    "U09UF01L43T",  # Joe Peters
+    "U0A70FX6Q5A",  # Kevin Comvalius
+    "U09DS8CJERX",  # Klansi Hess
+    "U09ML5X7S1Y",  # Kristopher Heenk
+    "U0840559K2S",  # Kyra Luu
+    "U08RA44MCNM",  # Lauren Kanipe
+    "U0A7KKK3C58",  # Miranda Petersen
+    "U08NKDDNAET",  # Parker Howard
+    "U09PBTC8PUK",  # Wade Montgomery
+    "U0AUZRQSYHH",  # Jeanette van Dorsten
+    "U0AT8EAD23H",  # Lyndsy Skiest
+    "U0AAHRT3BPY",  # Rohan Suwarna
+    "U0AGPJXMXL3",  # Tanav Thanjavuru
+})
+
 # {channel_id: channel_name} — all ops channels to monitor
 MONITORED_CHANNELS: dict[str, str] = _load_monitored_channels()
 
@@ -262,7 +287,7 @@ def handle_message(event, logger):
             logger.info("No pending items in #%s to cancel", channel_name)
     else:
         # A non-staff (client) sent a message — only track if a staff member is @mentioned
-        mentioned_responders = set(_MENTION_RE.findall(text)) & RESPONDER_IDS
+        mentioned_responders = set(_MENTION_RE.findall(text)) & TRACKED_RESPONDER_IDS
         if not mentioned_responders:
             return
 
