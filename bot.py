@@ -453,6 +453,69 @@ def _get_joined_channels() -> list[str]:
     return channels
 
 
+def _backfill_store(msg: dict, channel_id: str, channel_name: str, parent_ts: str | None = None) -> None:
+    user_id  = msg.get("user", "")
+    msg_ts   = msg.get("ts")
+    is_reply = parent_ts is not None
+    row = {
+        "channel_id":      channel_id,
+        "channel_name":    channel_name,
+        "message_ts":      msg_ts,
+        "thread_ts":       parent_ts if is_reply else None,
+        "is_thread_reply": is_reply,
+        "user_id":         user_id,
+        "user_name":       _user_name(user_id),
+        "text":            _resolve_mentions(msg.get("text") or ""),
+        "has_response":    user_id in RESPONDER_IDS,
+        "created_at":      datetime.fromtimestamp(float(msg_ts), tz=timezone.utc).isoformat(),
+    }
+    _sb_upsert_message(row)
+
+
+def _fetch_history_pages(channel_id: str, channel_name: str, oldest_ts: str | None) -> list[dict]:
+    """Fetch all top-level messages in a channel, optionally since oldest_ts."""
+    messages: list[dict] = []
+    cursor = None
+    while True:
+        try:
+            kwargs: dict = dict(channel=channel_id, limit=200)
+            if oldest_ts:
+                kwargs.update(oldest=oldest_ts, inclusive=False)
+            if cursor:
+                kwargs["cursor"] = cursor
+            result = app.client.conversations_history(**kwargs)
+        except Exception as exc:
+            logger.error("Backfill: history error for #%s: %s", channel_name, exc)
+            break
+        messages.extend(result.get("messages", []))
+        cursor = result.get("response_metadata", {}).get("next_cursor")
+        if not cursor:
+            break
+    return messages
+
+
+def _fetch_reply_pages(channel_id: str, channel_name: str, thread_ts: str, oldest_ts: str | None) -> list[dict]:
+    """Fetch all replies in a thread, optionally since oldest_ts."""
+    replies: list[dict] = []
+    cursor = None
+    while True:
+        try:
+            kwargs: dict = dict(channel=channel_id, ts=thread_ts, limit=200)
+            if oldest_ts:
+                kwargs.update(oldest=oldest_ts, inclusive=False)
+            if cursor:
+                kwargs["cursor"] = cursor
+            result = app.client.conversations_replies(**kwargs)
+        except Exception as exc:
+            logger.error("Backfill: replies error for thread %s in #%s: %s", thread_ts, channel_name, exc)
+            break
+        replies.extend(result.get("messages", []))
+        cursor = result.get("response_metadata", {}).get("next_cursor")
+        if not cursor:
+            break
+    return replies
+
+
 def _backfill_missed_messages() -> None:
     """Store any messages sent while the bot was offline into Supabase."""
     joined = _get_joined_channels()
@@ -462,7 +525,8 @@ def _backfill_missed_messages() -> None:
 
     for channel_id in joined:
         channel_name = _channel_name(channel_id)
-        # Find the latest message timestamp already stored for this channel
+
+        # Find the latest stored timestamp for this channel
         try:
             resp = http_requests.get(
                 f"{SB_URL}/rest/v1/slack_messages",
@@ -480,54 +544,75 @@ def _backfill_missed_messages() -> None:
             logger.error("Backfill: Supabase query error for #%s: %s", channel_name, exc)
             continue
 
-        if not rows:
-            continue
+        # oldest_ts=None means no history — fetch everything from Slack
+        oldest_ts: str | None = rows[0]["message_ts"] if rows else None
 
-        oldest_ts = rows[0]["message_ts"]
+        # ── Top-level messages ────────────────────────────────────────────────
+        top_messages = _fetch_history_pages(channel_id, channel_name, oldest_ts)
+        new_thread_parents: set[str] = set()
 
-        # Fetch all messages sent after the last stored one (paginated)
-        messages = []
-        cursor = None
-        while True:
-            try:
-                kwargs = dict(channel=channel_id, oldest=oldest_ts, inclusive=False, limit=200)
-                if cursor:
-                    kwargs["cursor"] = cursor
-                result = app.client.conversations_history(**kwargs)
-            except Exception as exc:
-                logger.error("Backfill: Slack API error for #%s: %s", channel_name, exc)
-                break
-            messages.extend(result.get("messages", []))
-            cursor = result.get("response_metadata", {}).get("next_cursor")
-            if not cursor:
-                break
-
-        if not messages:
-            continue
-
-        for msg in messages:
+        for msg in top_messages:
             if msg.get("subtype") or msg.get("bot_id"):
                 continue
-            user_id  = msg.get("user", "")
-            msg_ts   = msg.get("ts")
-            thread_ts = msg.get("thread_ts")
-            is_reply  = bool(thread_ts and thread_ts != msg_ts)
-            row = {
-                "channel_id":      channel_id,
-                "channel_name":    channel_name,
-                "message_ts":      msg_ts,
-                "thread_ts":       thread_ts if is_reply else None,
-                "is_thread_reply": is_reply,
-                "user_id":         user_id,
-                "user_name":       _user_name(user_id),
-                "text":            _resolve_mentions(msg.get("text") or ""),
-                "has_response":    user_id in RESPONDER_IDS,
-                "created_at":      datetime.fromtimestamp(float(msg_ts), tz=timezone.utc).isoformat(),
-            }
-            _sb_upsert_message(row)
+            _backfill_store(msg, channel_id, channel_name)
             total += 1
+            if msg.get("reply_count", 0) > 0:
+                new_thread_parents.add(msg["ts"])
 
-        logger.info("Backfill: stored %d messages from #%s", len(messages), channel_name)
+        # ── Also check pre-existing thread parents for new replies ────────────
+        # Query Supabase for all known thread_ts values in this channel so we
+        # can catch replies added to old threads while the bot was offline.
+        known_thread_parents: set[str] = set()
+        if oldest_ts:
+            sb_offset = 0
+            page_size = 1000
+            while True:
+                try:
+                    resp = http_requests.get(
+                        f"{SB_URL}/rest/v1/slack_messages",
+                        headers={**auth_headers, "Range-Unit": "items",
+                                 "Range": f"{sb_offset}-{sb_offset + page_size - 1}"},
+                        params={
+                            "select": "thread_ts",
+                            "channel_id": f"eq.{channel_id}",
+                            "is_thread_reply": "eq.true",
+                            "thread_ts": "not.is.null",
+                        },
+                        timeout=10,
+                    )
+                    page = resp.json() if resp.ok else []
+                except Exception as exc:
+                    logger.error("Backfill: thread parent query error for #%s: %s", channel_name, exc)
+                    break
+                for row in page:
+                    if row.get("thread_ts"):
+                        known_thread_parents.add(row["thread_ts"])
+                if len(page) < page_size:
+                    break
+                sb_offset += page_size
+
+        all_thread_parents = new_thread_parents | known_thread_parents
+
+        # ── Fetch replies for all thread parents ──────────────────────────────
+        for thread_ts in all_thread_parents:
+            # For known old threads, only fetch replies newer than oldest_ts
+            # For new threads (no prior history), fetch all replies
+            reply_oldest = oldest_ts if thread_ts in known_thread_parents else None
+            replies = _fetch_reply_pages(channel_id, channel_name, thread_ts, reply_oldest)
+            for reply in replies:
+                if reply.get("ts") == thread_ts:
+                    continue  # parent already stored above
+                if reply.get("subtype") or reply.get("bot_id"):
+                    continue
+                _backfill_store(reply, channel_id, channel_name, parent_ts=thread_ts)
+                total += 1
+
+        if top_messages or all_thread_parents:
+            logger.info(
+                "Backfill: #%s — %d top-level, %d threads (%d known + %d new)",
+                channel_name, len(top_messages),
+                len(all_thread_parents), len(known_thread_parents), len(new_thread_parents),
+            )
 
     logger.info("Backfill complete — %d messages stored.", total)
 
