@@ -435,11 +435,90 @@ def _checker_loop() -> None:
             _send_alert(info)
 
 
+def _backfill_missed_messages() -> None:
+    """Store any messages sent while the bot was offline into Supabase."""
+    logger.info("Backfill: scanning %d channels...", len(MONITORED_CHANNELS))
+    total = 0
+    auth_headers = {"apikey": SB_KEY, "Authorization": f"Bearer {SB_KEY}"}
+
+    for channel_id, channel_name in MONITORED_CHANNELS.items():
+        # Find the latest message timestamp already stored for this channel
+        try:
+            resp = http_requests.get(
+                f"{SB_URL}/rest/v1/slack_messages",
+                headers=auth_headers,
+                params={
+                    "select": "message_ts",
+                    "channel_id": f"eq.{channel_id}",
+                    "order": "message_ts.desc",
+                    "limit": "1",
+                },
+                timeout=10,
+            )
+            rows = resp.json() if resp.ok else []
+        except Exception as exc:
+            logger.error("Backfill: Supabase query error for #%s: %s", channel_name, exc)
+            continue
+
+        if not rows:
+            continue
+
+        oldest_ts = rows[0]["message_ts"]
+
+        # Fetch all messages sent after the last stored one (paginated)
+        messages = []
+        cursor = None
+        while True:
+            try:
+                kwargs = dict(channel=channel_id, oldest=oldest_ts, inclusive=False, limit=200)
+                if cursor:
+                    kwargs["cursor"] = cursor
+                result = app.client.conversations_history(**kwargs)
+            except Exception as exc:
+                logger.error("Backfill: Slack API error for #%s: %s", channel_name, exc)
+                break
+            messages.extend(result.get("messages", []))
+            cursor = result.get("response_metadata", {}).get("next_cursor")
+            if not cursor:
+                break
+
+        if not messages:
+            continue
+
+        for msg in messages:
+            if msg.get("subtype") or msg.get("bot_id"):
+                continue
+            user_id  = msg.get("user", "")
+            msg_ts   = msg.get("ts")
+            thread_ts = msg.get("thread_ts")
+            is_reply  = bool(thread_ts and thread_ts != msg_ts)
+            row = {
+                "channel_id":      channel_id,
+                "channel_name":    channel_name,
+                "message_ts":      msg_ts,
+                "thread_ts":       thread_ts if is_reply else None,
+                "is_thread_reply": is_reply,
+                "user_id":         user_id,
+                "user_name":       _user_name(user_id),
+                "text":            _resolve_mentions(msg.get("text") or ""),
+                "has_response":    user_id in RESPONDER_IDS,
+                "created_at":      datetime.fromtimestamp(float(msg_ts), tz=timezone.utc).isoformat(),
+            }
+            _sb_upsert_message(row)
+            total += 1
+
+        logger.info("Backfill: stored %d messages from #%s", len(messages), channel_name)
+
+    logger.info("Backfill complete — %d messages stored.", total)
+
+
 if __name__ == "__main__":
     logger.info("Loaded %d responder IDs from member_directory.csv", len(RESPONDER_IDS))
     logger.info("Monitoring %d channels from ops_channels.csv", len(MONITORED_CHANNELS))
     logger.info("Alert channel   : %s", ALERT_CHANNEL_ID)
     logger.info("Response timeout: %d minutes", RESPONSE_TIMEOUT_SECONDS // 60)
+
+    threading.Thread(target=_backfill_missed_messages, daemon=True).start()
 
     checker = threading.Thread(target=_checker_loop, daemon=True)
     checker.start()
