@@ -63,19 +63,6 @@ def _load_responder_ids() -> set[str]:
     return ids
 
 
-def _load_monitored_channels() -> dict[str, str]:
-    """Load ops channel IDs from ops_channels.csv. Returns {channel_id: channel_name}."""
-    path = os.path.join(_DIR, "ops_channels.csv")
-    channels = {}
-    with open(path, newline="") as f:
-        for row in csv.DictReader(f):
-            cid  = row.get("channel_id", "").strip()
-            name = row.get("channel_name", "").strip()
-            if cid:
-                channels[cid] = name
-    return channels
-
-
 # People responsible for responding — messages from anyone NOT in this set trigger the timer
 RESPONDER_IDS: set[str] = _load_responder_ids()
 
@@ -104,8 +91,8 @@ TRACKED_RESPONDER_IDS: frozenset[str] = frozenset({
     "U0AGPJXMXL3",  # Tanav Thanjavuru
 })
 
-# {channel_id: channel_name} — all ops channels to monitor
-MONITORED_CHANNELS: dict[str, str] = _load_monitored_channels()
+# Channel name cache — seeded at startup via conversations_list, then populated lazily
+_channel_cache: dict[str, str] = {}
 
 
 # ── Supabase helpers ──────────────────────────────────────────────────────────
@@ -188,6 +175,16 @@ def _sb_resolve_unanswered(channel_id: str, message_ts: str) -> None:
 _user_cache: dict[str, str] = {}
 
 
+def _channel_name(channel_id: str) -> str:
+    if channel_id not in _channel_cache:
+        try:
+            resp = app.client.conversations_info(channel=channel_id)
+            _channel_cache[channel_id] = resp["channel"].get("name", channel_id)
+        except Exception:
+            _channel_cache[channel_id] = channel_id
+    return _channel_cache[channel_id]
+
+
 def _user_name(user_id: str) -> str:
     if not user_id:
         return "unknown"
@@ -245,9 +242,6 @@ def handle_message(event, logger):
         return
 
     channel_id = event.get("channel")
-    if channel_id not in MONITORED_CHANNELS:
-        return
-
     user_id    = event.get("user", "")
     message_ts = event.get("ts")
     thread_ts  = event.get("thread_ts")
@@ -258,7 +252,7 @@ def handle_message(event, logger):
     def _store():
         row = {
             "channel_id":      channel_id,
-            "channel_name":    MONITORED_CHANNELS.get(channel_id, channel_id),
+            "channel_name":    _channel_name(channel_id),
             "message_ts":      message_ts,
             "thread_ts":       thread_ts if is_reply else None,
             "is_thread_reply": is_reply,
@@ -279,7 +273,7 @@ def handle_message(event, logger):
 
     if is_responder:
         # A Savvy staff member replied — cancel pending items where they were tagged
-        channel_name = MONITORED_CHANNELS.get(channel_id, channel_id)
+        channel_name = _channel_name(channel_id)
         logger.info("Staff reply from %s in #%s (thread: %s)", user_id, channel_name, thread_ts or "none")
         if any(k[0] == channel_id for k in pending):
             _cancel_channel_pending(channel_id, user_id)
@@ -303,7 +297,7 @@ def handle_message(event, logger):
                     thread_ts=message_ts,
                     text=WEEKEND_AUTO_REPLY,
                 )
-                logger.info("Sent weekend auto-reply in #%s", MONITORED_CHANNELS.get(channel_id, channel_id))
+                logger.info("Sent weekend auto-reply in #%s", _channel_name(channel_id))
             except Exception as exc:
                 logger.error("Failed to send weekend auto-reply: %s", exc)
             return
@@ -313,7 +307,7 @@ def handle_message(event, logger):
             return
 
         # Within business hours — start tracking
-        channel_name = MONITORED_CHANNELS.get(channel_id, channel_id)
+        channel_name = _channel_name(channel_id)
         with pending_lock:
             pending[(channel_id, message_ts)] = {
                 "channel":             channel_id,
@@ -435,13 +429,39 @@ def _checker_loop() -> None:
             _send_alert(info)
 
 
+def _get_joined_channels() -> list[str]:
+    """Return IDs of all channels the bot is currently a member of."""
+    channels = []
+    cursor = None
+    while True:
+        try:
+            kwargs = dict(types="public_channel,private_channel", exclude_archived=True, limit=200)
+            if cursor:
+                kwargs["cursor"] = cursor
+            result = app.client.conversations_list(**kwargs)
+        except Exception as exc:
+            logger.error("Backfill: failed to list channels: %s", exc)
+            break
+        for ch in result.get("channels", []):
+            if ch.get("is_member"):
+                cid = ch["id"]
+                _channel_cache[cid] = ch.get("name", cid)
+                channels.append(cid)
+        cursor = result.get("response_metadata", {}).get("next_cursor")
+        if not cursor:
+            break
+    return channels
+
+
 def _backfill_missed_messages() -> None:
     """Store any messages sent while the bot was offline into Supabase."""
-    logger.info("Backfill: scanning %d channels...", len(MONITORED_CHANNELS))
+    joined = _get_joined_channels()
+    logger.info("Backfill: scanning %d joined channels...", len(joined))
     total = 0
     auth_headers = {"apikey": SB_KEY, "Authorization": f"Bearer {SB_KEY}"}
 
-    for channel_id, channel_name in MONITORED_CHANNELS.items():
+    for channel_id in joined:
+        channel_name = _channel_name(channel_id)
         # Find the latest message timestamp already stored for this channel
         try:
             resp = http_requests.get(
@@ -514,7 +534,7 @@ def _backfill_missed_messages() -> None:
 
 if __name__ == "__main__":
     logger.info("Loaded %d responder IDs from member_directory.csv", len(RESPONDER_IDS))
-    logger.info("Monitoring %d channels from ops_channels.csv", len(MONITORED_CHANNELS))
+    logger.info("Monitoring all joined channels (allowlist removed)")
     logger.info("Alert channel   : %s", ALERT_CHANNEL_ID)
     logger.info("Response timeout: %d minutes", RESPONSE_TIMEOUT_SECONDS // 60)
 
